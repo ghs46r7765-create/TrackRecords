@@ -1,0 +1,9 @@
+{
+  "name": "laufvergleich",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "garmin-connect": "^1.6.2",
+    "jszip": "^3.10.1"
+  }
+}
