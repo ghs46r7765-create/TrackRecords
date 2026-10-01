@@ -1387,7 +1387,7 @@ function App(){
             comparisons=${comparisons} activeComparisonId=${activeComparisonId}
             onSave=${(name,notes) => saveComparison(name,notes,false)}
             onSaveAsNew=${(name,notes) => saveComparison(name,notes,true)}
-            onLoad=${loadComparison} onDelete=${deleteComparison} onRename=${renameComparison} onClose=${closeComparison} />`}
+            onLoad=${loadComparison} onDelete=${deleteComparison} onRename=${renameComparison} onClose=${closeComparison} profile=${profile} />`}
           ${tab === "garmin" && html`<${GarminTab} showToast=${showToast} />`}
           ${tab === "globus" && html`<${GlobusTab} runs=${sortedRuns} selected=${selected} onToggle=${toggleSelect} onImport=${handleImport} showToast=${showToast} />`}
           </div>
@@ -2418,12 +2418,14 @@ function GlobusTab({ runs, selected, onToggle, onImport, showToast }){
   `;
 }
 
-function VergleichTab({ runs, selected, onToggle, comparisons, activeComparisonId, onSave, onSaveAsNew, onLoad, onDelete, onRename, onClose }){
+function VergleichTab({ runs, selected, onToggle, comparisons, activeComparisonId, onSave, onSaveAsNew, onLoad, onDelete, onRename, onClose, profile }){
   const selRuns = runs.filter(r => selected.has(r.id)).sort((a,b) => new Date(a.start)-new Date(b.start));
   const selWithRoute = selRuns.filter(r => r.route && r.hasTime);
   const [pairA, setPairA] = useState(null);
   const [pairB, setPairB] = useState(null);
   const [showMapTiles, setShowMapTiles] = useState(false);
+  const [tableSortKey, setTableSortKey] = useState("date");
+  const [tableSortDir, setTableSortDir] = useState("desc");
   const activeComparison = (comparisons || []).find(c => c.id === activeComparisonId) || null;
   const [nameInput, setNameInput] = useState(activeComparison ? activeComparison.name : "");
   const [notesInput, setNotesInput] = useState(activeComparison ? activeComparison.notes : "");
@@ -2500,6 +2502,44 @@ function VergleichTab({ runs, selected, onToggle, comparisons, activeComparisonI
     }
     return arr;
   }, [comparisons, comparisonSort]);
+
+  function tableToggleSort(key){
+    if(tableSortKey === key){
+      setTableSortDir(d => d === "asc" ? "desc" : "asc");
+    } else {
+      setTableSortKey(key);
+      setTableSortDir(key === "date" ? "desc" : "asc");
+    }
+  }
+  function tableSortArrow(key){
+    return tableSortKey === key ? (tableSortDir === "asc" ? " ▲" : " ▼") : "";
+  }
+  function tableSortValue(r, key){
+    switch(key){
+      case "date": { const t = new Date(r.start).getTime(); return isNaN(t) ? 0 : t; }
+      case "distance": return r.distanceKm ?? -1;
+      case "duration": return r.durationSec ?? -1;
+      case "agt": return computeAgeGrade(profile.birthDate, profile.gender, r.start, r.distanceKm, r.durationSec) ?? -1;
+      case "pace": return r.avgPaceSecPerKm ?? -1;
+      case "location": return r.location || "";
+      case "route": return r.route ? 1 : 0;
+      default: return 0;
+    }
+  }
+  const sortedSelRuns = useMemo(() => {
+    const arr = [...selRuns];
+    arr.sort((a,b) => {
+      const av = tableSortValue(a, tableSortKey), bv = tableSortValue(b, tableSortKey);
+      let cmp;
+      if(typeof av === "string" || typeof bv === "string"){
+        cmp = String(av).localeCompare(String(bv), "de");
+      } else {
+        cmp = av - bv;
+      }
+      return tableSortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [selRuns, tableSortKey, tableSortDir, profile]);
 
   return html`
     <div>
@@ -2608,6 +2648,41 @@ function VergleichTab({ runs, selected, onToggle, comparisons, activeComparisonI
             <div class="chart-wrap"><${BarChart} labels=${splitLabels} values=${splitDiffs} xLabel="Kilometer" yLabel="Pace-Differenz (s/km)" /></div>
           `}
         `}
+      </section>
+    `}
+
+    ${selRuns.length > 0 && html`
+      <section class="panel">
+        <h2 class="panel-title">Ausgewählte Läufe <span class="n">${selRuns.length}</span></h2>
+        <p class="hint">Spaltenüberschriften antippen, um zu sortieren.</p>
+        <div style="overflow-x:auto;">
+        <table class="runs">
+          <thead><tr>
+            <th></th>
+            <th onClick=${() => tableToggleSort("date")} style="cursor:pointer;">Datum${tableSortArrow("date")}</th>
+            <th onClick=${() => tableToggleSort("distance")} style="cursor:pointer;">Distanz${tableSortArrow("distance")}</th>
+            <th onClick=${() => tableToggleSort("duration")} style="cursor:pointer;">Dauer${tableSortArrow("duration")}</th>
+            <th onClick=${() => tableToggleSort("agt")} style="cursor:pointer;">AGT${tableSortArrow("agt")}</th>
+            <th onClick=${() => tableToggleSort("pace")} style="cursor:pointer;">Ø Pace${tableSortArrow("pace")}</th>
+            <th onClick=${() => tableToggleSort("location")} style="cursor:pointer;">Ort${tableSortArrow("location")}</th>
+            <th onClick=${() => tableToggleSort("route")} style="cursor:pointer;">Route${tableSortArrow("route")}</th>
+          </tr></thead>
+          <tbody>
+            ${sortedSelRuns.map(r => html`
+              <tr key=${r.id}>
+                <td><input type="checkbox" class="checkbox" checked=${selected.has(r.id)} onChange=${() => onToggle(r.id)} /></td>
+                <td>${fmtDate(r.start)}</td>
+                <td>${fmtKm(r.distanceKm)}</td>
+                <td>${fmtDuration(r.durationSec)}</td>
+                <td>${fmtAGT(computeAgeGrade(profile.birthDate, profile.gender, r.start, r.distanceKm, r.durationSec))}</td>
+                <td>${fmtPace(r.avgPaceSecPerKm)}</td>
+                <td>${r.route ? (r.location === undefined ? "…" : (r.location || "–")) : "–"}</td>
+                <td>${r.route ? html`<span class="tag route-ok">GPS</span>` : html`<span class="tag">–</span>`}</td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+        </div>
       </section>
     `}
 
