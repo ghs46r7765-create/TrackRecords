@@ -1077,6 +1077,66 @@ function garminDurationSec(a){ return a.duration != null ? a.duration : null; }
 function garminDistanceKm(a){ return a.distance != null ? a.distance / 1000 : null; }
 function garminTypeLabel(a){ return (a.activityType && a.activityType.typeKey) || "unbekannt"; }
 
+/* ══════════════════════════════════════════════════════════════════════
+   Import-Abgleich (Datenstand zwischen Geräten austauschen)
+   Lauf-IDs sind pro Gerät zufällig (uid()) — Duplikate werden deshalb über
+   einen Inhalts-Fingerabdruck erkannt (Startzeit + Distanz + Dauer).
+   ══════════════════════════════════════════════════════════════════════ */
+function runFingerprint(r){
+  const t = new Date(r.start).getTime();
+  const km = typeof r.distanceKm === "number" ? Math.round(r.distanceKm * 100) : -1;
+  const dur = typeof r.durationSec === "number" ? Math.round(r.durationSec) : -1;
+  return (isNaN(t) ? String(r.start) : t) + "|" + km + "|" + dur;
+}
+const IMPORT_SUFFIX_RE = /\s\(Import \d{2}\.\d{2}\.\d{4}(?:, \d+)?\)$/;
+/* Inhalts-Signatur eines Vergleichs: Name ohne Import-Suffix, Notiz und Lauf-Auswahl
+   (ohne Reihenfolge). Gleiche Signatur = inhaltlich derselbe Vergleich. */
+function comparisonSignature(c, runIds){
+  const ids = [...new Set(runIds || c.runIds || [])].sort();
+  return JSON.stringify([(c.name || "").replace(IMPORT_SUFFIX_RE, "").trim(), (c.notes || "").trim(), ids]);
+}
+/* Reine Planungsfunktion (schreibt nichts): bestimmt, was beim Import neu ist,
+   was übersprungen wird und welche Vergleiche als Kopie angelegt werden. */
+function planBackupImport(validRuns, validComparisons, localRuns, localComps, dateLabel){
+  const localIds = new Set(localRuns.map(r => r.id));
+  const fpToId = new Map();
+  localRuns.forEach(r => { fpToId.set(runFingerprint(r), r.id); });
+  const idMap = new Map(); // importierte Lauf-ID -> ID, unter der der Lauf lokal vorliegt
+  const newRuns = [];
+  let skippedRuns = 0;
+  for(const r of validRuns){
+    if(localIds.has(r.id)){ idMap.set(r.id, r.id); skippedRuns++; continue; }
+    const fp = runFingerprint(r);
+    if(fpToId.has(fp)){ idMap.set(r.id, fpToId.get(fp)); skippedRuns++; continue; }
+    newRuns.push(r); idMap.set(r.id, r.id); localIds.add(r.id); fpToId.set(fp, r.id);
+  }
+
+  const localSigs = new Set(localComps.map(c => comparisonSignature(c)));
+  const localCompIds = new Set(localComps.map(c => c.id));
+  const takenNames = new Set(localComps.map(c => c.name || ""));
+  const newComps = [], copies = [];
+  let skippedComps = 0;
+  for(const c of validComparisons){
+    const runIds = [...new Set(c.runIds.map(id => idMap.has(id) ? idMap.get(id) : id))];
+    const remapped = { ...c, runIds };
+    const sig = comparisonSignature(remapped);
+    if(localSigs.has(sig)){ skippedComps++; continue; }
+    if(localCompIds.has(c.id)){
+      const origName = c.name || "Ohne Namen";
+      const base = origName + " (Import " + dateLabel + ")";
+      let name = base, n = 2;
+      while(takenNames.has(name)){ name = base.replace(/\)$/, ", " + (n++) + ")"); }
+      const copy = { ...remapped, id: uid(), name };
+      newComps.push(copy); copies.push({ origName, name });
+      localSigs.add(comparisonSignature(copy)); localCompIds.add(copy.id); takenNames.add(name);
+    } else {
+      newComps.push(remapped);
+      localSigs.add(sig); localCompIds.add(c.id); takenNames.add(c.name || "");
+    }
+  }
+  return { newRuns, skippedRuns, newComps, skippedComps, copies, idMap };
+}
+
 function App(){
   const [runs, setRuns] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -1202,8 +1262,10 @@ function App(){
      (welche Garmin-Aktivitäten schon heruntergeladen wurden) ist unkritisch
      und wird für Kontinuität über Geräte hinweg mitgesichert. */
   async function buildBackupPayload(){
-    const [garminActivities, garminSync] = await Promise.all([idbGetAllGarminActivities(), idbGetGarminSync()]);
-    const payload = { version: 1, exportedAt: new Date().toISOString(), runs, comparisons, garminActivities, garminSync };
+    const [allRuns, allComps, garminActivities, garminSync] = await Promise.all([idbGetAll(), idbGetAllComparisons(), idbGetAllGarminActivities(), idbGetGarminSync()]);
+    const payload = { version: 2, exportedAt: new Date().toISOString(), runs: allRuns, comparisons: allComps, garminActivities, garminSync };
+    /* AGT-Profil (Geburtsdatum/Geschlecht) liegt nur in localStorage und wird für den Geräteaustausch mitgegeben */
+    if(profile && (profile.birthDate || profile.gender)) payload.profile = { birthDate: profile.birthDate || null, gender: profile.gender || null };
     const filename = `laufvergleich-backup-${new Date().toISOString().slice(0,10)}.json`;
     return { payload, filename };
   }
@@ -1248,11 +1310,13 @@ function App(){
     }
   }
 
-  /* Restore ist bewusst additiv (Upsert per ID), nicht destruktiv: bestehende
-     Läufe/Vergleiche mit gleicher ID werden überschrieben, alles andere bleibt
-     erhalten. Ein vollständiges "Zurücksetzen auf Backup-Stand" gibt es nicht,
-     um versehentlichen Datenverlust durch ein veraltetes Backup zu vermeiden —
-     wer wirklich ersetzen will, nutzt vorher "Alle löschen". */
+  /* Import führt die Datei mit dem lokalen Stand zusammen und überschreibt nie:
+     - Läufe: gleiche ID oder gleicher Inhalt (Startzeit + Distanz + Dauer) = Duplikat, wird übersprungen.
+     - Vergleiche: inhaltlich identisch = übersprungen; gleiche ID, aber abweichend (z.B. mehr Läufe
+       im anderen Datenstand) = parallele Kopie "Name (Import TT.MM.JJJJ)", Original bleibt unverändert.
+       Lauf-Verweise werden auf lokal vorhandene Läufe umgebogen, falls ein Lauf als Duplikat erkannt wurde.
+     - AGT-Profil: wird nur in leere lokale Felder übernommen.
+     Vorab gibt es eine Zusammenfassung zur Bestätigung, danach eine Ergebnis-Meldung. */
   async function restoreFromBackup(file){
     let text;
     try{ text = await file.text(); } catch(e){ showToast("Backup-Datei konnte nicht gelesen werden."); return; }
@@ -1281,19 +1345,53 @@ function App(){
       : [];
     const validGarminSync = (data && data.garminSync && typeof data.garminSync.lastImportDate === "string") ? data.garminSync : null;
 
-    const ok = confirm(
-      `${validRuns.length} Läufe${validComparisons.length ? ` und ${validComparisons.length} gespeicherte Vergleiche` : ""} aus dem Backup wiederherstellen?\n\nBestehende Einträge mit gleicher ID werden überschrieben, alle anderen bleiben unverändert erhalten.`
-    );
-    if(!ok) return;
+    const profilePatch = {};
+    const fileProfile = data && !Array.isArray(data) && data.profile && typeof data.profile === "object" ? data.profile : null;
+    if(fileProfile){
+      if(typeof fileProfile.birthDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(fileProfile.birthDate) && !profile.birthDate) profilePatch.birthDate = fileProfile.birthDate;
+      if((fileProfile.gender === "M" || fileProfile.gender === "F") && !profile.gender) profilePatch.gender = fileProfile.gender;
+    }
+    const hasProfilePatch = Object.keys(profilePatch).length > 0;
 
-    await idbPutMany(validRuns);
-    if(validComparisons.length) await Promise.all(validComparisons.map(c => idbPutComparison(c)));
+    const [localRuns, localComps] = await Promise.all([idbGetAll(), idbGetAllComparisons()]);
+    const dateLabel = new Date().toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" });
+    const plan = planBackupImport(validRuns, validComparisons, localRuns, localComps, dateLabel);
+    const nothingNew = plan.newRuns.length === 0 && plan.newComps.length === 0 && !hasProfilePatch;
+
+    if(!nothingNew){
+      const lines = ["Import-Vorschau:", `• Läufe: ${plan.newRuns.length} neu, ${plan.skippedRuns} bereits vorhanden (werden übersprungen)`];
+      if(validComparisons.length){
+        lines.push(`• Vergleiche: ${plan.newComps.length - plan.copies.length} neu, ${plan.skippedComps} bereits identisch vorhanden, ${plan.copies.length} abweichend`);
+      }
+      if(plan.copies.length){
+        lines.push("", "Abweichende Vergleiche werden parallel als Kopie angelegt:");
+        plan.copies.forEach(k => lines.push(`  „${k.origName}" → „${k.name}"`));
+      }
+      if(hasProfilePatch) lines.push("", "AGT-Profil (Geburtsdatum/Geschlecht) wird übernommen, da lokal noch leer.");
+      lines.push("", "Bestehende Daten werden nicht verändert. Fortfahren?");
+      if(!confirm(lines.join("\n"))) return;
+    }
+
+    if(plan.newRuns.length) await idbPutMany(plan.newRuns);
+    if(plan.newComps.length) await Promise.all(plan.newComps.map(c => idbPutComparison(c)));
     if(validGarminActivities.length) await idbPutGarminActivities(validGarminActivities);
     if(validGarminSync) await idbSetGarminSync(validGarminSync);
+    if(hasProfilePatch) updateProfile(profilePatch);
     const [allRuns, allComps] = await Promise.all([idbGetAll(), idbGetAllComparisons()]);
     setRuns(allRuns);
     setComparisons(allComps);
-    showToast(`Wiederhergestellt: ${validRuns.length} Läufe${validComparisons.length ? `, ${validComparisons.length} Vergleiche` : ""}.`);
+
+    if(nothingNew){
+      showToast("Nichts zu importieren: alle Läufe und Vergleiche sind bereits vorhanden.");
+    } else if(plan.copies.length){
+      alert(
+        `Import abgeschlossen. Neue Läufe: ${plan.newRuns.length}, neue Vergleiche: ${plan.newComps.length - plan.copies.length}, bereits vorhandene Läufe: ${plan.skippedRuns}.\n\n` +
+        `Abweichende Vergleiche wurden als Kopie angelegt (Originale unverändert):\n` +
+        plan.copies.map(k => `• ${k.name}`).join("\n")
+      );
+    } else {
+      showToast(`Import abgeschlossen. Neue Läufe: ${plan.newRuns.length}${plan.newComps.length ? `, neue Vergleiche: ${plan.newComps.length}` : ""}; bereits vorhanden: ${plan.skippedRuns}.`);
+    }
   }
 
   async function handleRestoreFileChange(e){
@@ -1539,7 +1637,7 @@ function ListeTab({ runs, fileRef, onImport, onDelete, onClearAll, onBackup, onS
           <button class="btn ghost small" onClick=${() => restoreFileRef.current && restoreFileRef.current.click()}>♻️ Wiederherstellen</button>
           <button class="btn danger small" onClick=${onClearAll}>Alle löschen</button>
         </div>
-        <p class="hint" style="margin-top:8px;">"Auf anderes Gerät übertragen" öffnet die iOS-Teilen-Übersicht (z.B. AirDrop, Nachrichten, Mail) mit der Backup-Datei direkt im Gepäck. Auf dem Zielgerät die Datei öffnen bzw. in „Dateien" sichern und dort über „Wiederherstellen" importieren. "Wiederherstellen" ergänzt/überschreibt anhand der ID aus einer Backup-Datei — bestehende Daten, die nicht im Backup enthalten sind, bleiben unangetastet.</p>
+        <p class="hint" style="margin-top:8px;">"Auf anderes Gerät übertragen" öffnet die iOS-Teilen-Übersicht (z.B. AirDrop, Nachrichten, Mail) mit der Backup-Datei direkt im Gepäck. Auf dem Zielgerät die Datei öffnen bzw. in „Dateien" sichern und dort über „Wiederherstellen" importieren. "Wiederherstellen" führt die Datei mit den vorhandenen Daten zusammen: Läufe, die es lokal schon gibt (gleiche Startzeit, Distanz und Dauer), werden übersprungen; abweichende gespeicherte Vergleiche werden parallel als Kopie „Name (Import TT.MM.JJJJ)" angelegt. Bestehende Daten werden nie überschrieben.</p>
       `}
     </section>
     </div>
