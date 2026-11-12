@@ -1208,7 +1208,7 @@ function App(){
       try{
         const { payload, filename } = await buildBackupPayload();
         if(cancelled) return;
-        shareFileRef.current = new File([JSON.stringify(payload, null, 2)], filename, { type: "application/json" });
+        shareFileRef.current = new File([JSON.stringify(payload)], filename, { type: "application/json" });
       } catch(e){ /* Teilen meldet dann „wird vorbereitet" bzw. fällt auf Download zurück */ }
     }, 600);
     return () => { cancelled = true; clearTimeout(timer); };
@@ -1287,13 +1287,32 @@ function App(){
     const filename = `laufvergleich-backup-${new Date().toISOString().slice(0,10)}.json`;
     return { payload, filename };
   }
+  /* Reiner Datei-Download. Safari-Besonderheiten: Link muss im Dokument hängen, und die
+     Blob-URL darf nicht sofort widerrufen werden (sonst bricht Safari den Download ab).
+     Kompaktes JSON (ohne Einrückung) hält die Datei klein; Fehler werden sichtbar gemeldet. */
+  async function downloadBackupFile(){
+    try{
+      const { payload, filename } = await buildBackupPayload();
+      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); if(a.parentNode) a.parentNode.removeChild(a); }, 60000);
+    } catch(e){
+      showToast("Backup fehlgeschlagen: " + (e && e.message ? e.message : String(e)));
+    }
+  }
+  /* Button "Backup (JSON)". Als zum Home-Bildschirm hinzugefügte Web-App (Standalone) kann iOS
+     keine Dateien per Link herunterladen — dort wird stattdessen der Teilen-Dialog genutzt
+     ("In Dateien sichern"), sofern die vorbereitete Datei bereitsteht. */
   async function backup(){
-    const { payload, filename } = await buildBackupPayload();
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = filename;
-    a.click(); URL.revokeObjectURL(url);
+    const f = shareFileRef.current;
+    if(window.navigator.standalone && f && navigator.canShare && navigator.canShare({ files: [f] })){
+      return shareBackup();
+    }
+    return downloadBackupFile();
   }
 
   /* Geräteübertragung: nutzt die native Web-Share-API (Safari iOS 15+), um die
@@ -1324,10 +1343,13 @@ function App(){
           text: `${runs.length} Läufe, ${comparisons.length} Vergleiche`,
         });
       } catch(e){
-        if(e && e.name !== "AbortError") backup();
+        if(e && e.name !== "AbortError"){
+          showToast(`Teilen fehlgeschlagen (${e.name || "Fehler"}${e.message ? ": " + e.message : ""}) — Datei wird stattdessen heruntergeladen.`);
+          downloadBackupFile();
+        }
       }
     } else {
-      backup();
+      downloadBackupFile();
       showToast("Direktes Teilen wird hier nicht unterstützt — Datei wurde stattdessen heruntergeladen, bitte manuell weiterreichen (z.B. per AirDrop).");
     }
   }
