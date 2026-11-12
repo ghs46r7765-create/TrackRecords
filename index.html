@@ -1148,6 +1148,7 @@ function App(){
   const [profile, setProfile] = useState(() => loadProfile());
   const fileRef = useRef(null);
   const restoreFileRef = useRef(null);
+  const shareFileRef = useRef(null); // vorbereitete Backup-Datei für den iOS-Teilen-Dialog
 
   function updateProfile(patch){
     setProfile(prev => {
@@ -1195,6 +1196,23 @@ function App(){
     })();
     return () => { cancelled = true; };
   }, [runs, loaded]);
+
+  /* iOS Safari erlaubt navigator.share nur direkt im Tipp-Ereignis (transiente Aktivierung).
+     Deshalb wird die Backup-Datei vorab (leicht verzögert, damit schnelle Änderungen wie die
+     Orts-Ermittlung nicht jedes Mal neu bauen) vorbereitet und beim Tippen sofort geteilt. */
+  useEffect(() => {
+    if(!loaded || tab !== "liste") return;
+    let cancelled = false;
+    shareFileRef.current = null;
+    const timer = setTimeout(async () => {
+      try{
+        const { payload, filename } = await buildBackupPayload();
+        if(cancelled) return;
+        shareFileRef.current = new File([JSON.stringify(payload, null, 2)], filename, { type: "application/json" });
+      } catch(e){ /* Teilen meldet dann „wird vorbereitet" bzw. fällt auf Download zurück */ }
+    }, 600);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [loaded, tab, runs, comparisons, profile]);
 
   function showToast(msg){ setToast(msg); setTimeout(() => setToast(null), 4200); }
 
@@ -1286,18 +1304,22 @@ function App(){
      wenn die Web-Share-API mit Dateien nicht unterstützt wird (z.B. Desktop-
      Browser) oder das Teilen aus einem anderen Grund als Nutzerabbruch fehlschlägt. */
   async function shareBackup(){
-    const { payload, filename } = await buildBackupPayload();
-    let file;
-    try{
-      file = new File([JSON.stringify(payload, null, 2)], filename, { type: "application/json" });
-    } catch(e){
-      backup();
+    const file = shareFileRef.current;
+    if(!file){
+      showToast("Backup-Datei wird noch vorbereitet — bitte in einem Moment noch einmal tippen.");
       return;
     }
-    if(navigator.canShare && navigator.canShare({ files: [file] })){
+    /* Wichtig: bis zum Aufruf von navigator.share() darf kein await stehen, sonst verfällt
+       die Tipp-Berechtigung von iOS und der Teilen-Dialog öffnet sich nicht. */
+    let shareFile = file;
+    if(!(navigator.canShare && navigator.canShare({ files: [shareFile] }))){
+      // manche iOS-Versionen lehnen application/json ab — dieselbe Datei als Text anbieten
+      try{ shareFile = new File([file], file.name, { type: "text/plain" }); } catch(e){ shareFile = file; }
+    }
+    if(navigator.canShare && navigator.canShare({ files: [shareFile] })){
       try{
         await navigator.share({
-          files: [file],
+          files: [shareFile],
           title: "Laufvergleich-Backup",
           text: `${runs.length} Läufe, ${comparisons.length} Vergleiche`,
         });
